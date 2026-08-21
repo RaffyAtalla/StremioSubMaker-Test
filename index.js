@@ -3441,7 +3441,7 @@ app.post('/api/validate-gemini', validationLimiter, async (req, res) => {
         const { httpAgent, httpsAgent } = require('./src/utils/httpAgents');
 
         // Use v1 endpoint and API key header for validation
-        const geminiUrl = 'https://generativelanguage.googleapis.com/v1/models';
+        const geminiUrl = 'https://generativelanguage.googleapis.com/v1beta/models';
 
         try {
             const response = await axios.get(geminiUrl, {
