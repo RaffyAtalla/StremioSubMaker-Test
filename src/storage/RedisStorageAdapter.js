@@ -60,6 +60,10 @@ class RedisStorageAdapter extends StorageAdapter {
     const { keyPrefix: _ignoredKeyPrefix, ...restOptions } = options || {};
     const commandTimeout = parsePositiveIntEnv('REDIS_COMMAND_TIMEOUT_MS', DEFAULT_REDIS_COMMAND_TIMEOUT_MS);
 
+    // Enable TLS when REDIS_TLS=true (required by managed providers like
+    // Upstash, Redis Cloud, etc. that only accept encrypted connections).
+    const useTls = process.env.REDIS_TLS === 'true';
+
     if (sentinelEnabled) {
       // Redis Sentinel configuration for HA deployments
       const sentinels = process.env.REDIS_SENTINELS
@@ -78,6 +82,7 @@ class RedisStorageAdapter extends StorageAdapter {
         db: restOptions.db || process.env.REDIS_DB || 0,
         keyPrefix: canonicalPrefix,
         commandTimeout,
+        tls: useTls ? {} : undefined,
         enableOfflineQueue: false,
         maxRetriesPerRequest: 3,
         retryStrategy: (times) => {
@@ -100,6 +105,7 @@ class RedisStorageAdapter extends StorageAdapter {
         db: restOptions.db || process.env.REDIS_DB || 0,
         keyPrefix: canonicalPrefix,
         commandTimeout,
+        tls: useTls ? {} : undefined,
         enableOfflineQueue: false,
         maxRetriesPerRequest: 3,
         retryStrategy: (times) => {
