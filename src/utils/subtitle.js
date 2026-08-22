@@ -247,12 +247,9 @@ function parseSRT(srtContent) {
   }
 
   const entries = [];
-  // CRLF-aware splitting: handles both \n\n (LF) and \r\n\r\n (CRLF) line endings
-  // Pattern (?:\r?\n){2,} matches 2 or more consecutive newlines (with optional \r before each \n)
   const blocks = srtContent.trim().split(/(?:\r?\n){2,}/);
 
   for (const block of blocks) {
-    // Also handle CRLF when splitting lines within each block
     const lines = block.trim().split(/\r?\n/);
     if (lines.length < 3) continue;
 
@@ -291,7 +288,6 @@ function escapeRegExp(str) {
 function appendHiddenInformationalNote(srtContent, note = DEFAULT_INFO_SUBTITLE_NOTE, minLength = MIN_INFO_SUBTITLE_LENGTH) {
   try {
     const base = typeof srtContent === 'string' ? srtContent : String(srtContent || '');
-    // Strip any visible occurrences of the note so it only lives in the hidden cue
     const sanitized = base.replace(new RegExp(escapeRegExp(note), 'g'), '').trimEnd();
     const entries = parseSRT(sanitized) || [];
     const lastId = entries.length > 0 ? Math.max(...entries.map(e => parseInt(e.id, 10) || 0)) : 0;
@@ -328,8 +324,6 @@ function appendHiddenInformationalNote(srtContent, note = DEFAULT_INFO_SUBTITLE_
 function toSRT(entries) {
   return entries
     .map(entry => {
-      // Ensure text uses only LF (\n), not CRLF (\r\n)
-      // This prevents extra spacing issues on Linux
       const normalizedText = entry.text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
       return `${entry.id}\n${entry.timecode}\n${normalizedText}`;
     })
@@ -338,7 +332,6 @@ function toSRT(entries) {
 
 /**
  * Normalize SRT cue numbering to 1..N while preserving timing/text.
- * Some third-party converters keep internal meta rows in their cue counter.
  * @param {string} srtContent - SRT content
  * @returns {string} - Renumbered SRT content
  */
@@ -361,7 +354,6 @@ function srtTimeToVttTime(tc) {
   return String(tc || '').replace(/,/g, '.');
 }
 
-// Parse SRT timecode duration in milliseconds (00:00:00,000 --> 00:00:05,000)
 function srtDurationMs(tc) {
   const m = /^(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})/.exec(String(tc || '').trim());
   if (!m) return 0;
@@ -370,29 +362,15 @@ function srtDurationMs(tc) {
 }
 
 /**
- * Convert two aligned SRT strings into a dual-language WebVTT output
- * - Merges both languages into a single cue per entry (line break separated)
- *   for maximum cross-player compatibility (Android, Android TV, desktop)
- * - Order controls which language appears on the first line
+ * Custom Dual Subtitle Formatter:
+ * Baris 1: English Bold (Putih)
+ * Baris 2: Indonesian Italic Small (Abu-abu Cerah)
  */
 function srtPairToWebVTT(sourceSrt, targetSrt, order = 'source-top', placement = 'stacked', options = {}) {
   try {
     const srcEntries = parseSRT(sourceSrt);
     const trgEntries = parseSRT(targetSrt);
-    const srcTop = order === 'source-top';
-    const italic = options.learnItalic !== false; // default true
-    const italicTarget = options.learnItalicTarget || 'target'; // 'target' | 'source'
-    const isStatusCue = (text) => /TRANSLATION IN PROGRESS|Reload this subtitle/i.test(String(text || ''));
-
-    // When we only have a partial translation, limit cues to what the target has (including the status tail)
-    const statusIndex = trgEntries.findIndex(e => isStatusCue(e.text));
-    const hasStatusTail = statusIndex !== -1;
-    const translatedCount = hasStatusTail ? Math.max(0, statusIndex) : trgEntries.length;
-    const isPartial = hasStatusTail || (trgEntries.length > 0 && trgEntries.length < srcEntries.length);
-    const count = isPartial
-      ? Math.min(translatedCount, srcEntries.length)
-      : Math.max(srcEntries.length, trgEntries.length);
-
+    const count = Math.max(srcEntries.length, trgEntries.length);
     const lines = ['WEBVTT', ''];
 
     for (let i = 0; i < count; i++) {
@@ -400,78 +378,27 @@ function srtPairToWebVTT(sourceSrt, targetSrt, order = 'source-top', placement =
       const t = trgEntries[i];
       if (!s && !t) continue;
 
-      // Choose timecode: prefer target when it exists and is a status cue or longer than source
-      let chosenTimecode = (s && s.timecode) || '';
-      if (t && t.timecode) {
-        if (!chosenTimecode) {
-          chosenTimecode = t.timecode;
-        } else if (isStatusCue(t.text) || srtDurationMs(t.timecode) > srtDurationMs(chosenTimecode)) {
-          chosenTimecode = t.timecode;
-        }
-      }
-
-      if (!chosenTimecode) {
-        chosenTimecode = '00:00:00,000 --> 00:00:05,000';
-      }
-
+      let chosenTimecode = (s && s.timecode) || (t && t.timecode) || '00:00:00,000 --> 00:00:05,000';
       const vttTime = srtTimeToVttTime(chosenTimecode);
 
-      // Status cues render alone so they don't get paired with source text
-      if (isStatusCue(t && t.text)) {
-        lines.push(vttTime);
-        lines.push(sanitizeSubtitleText(t.text));
-        lines.push('');
-        continue;
-      }
+      const sText = sanitizeSubtitleText(s?.text || '');
+      const tText = sanitizeSubtitleText(t?.text || '');
 
-      let firstLine = srcTop ? (s && s.text) : (t && t.text);
-      let secondLine = srcTop ? (t && t.text) : (s && s.text);
-
-      // Fallback: if only one side exists, show it alone
-      if (!firstLine && secondLine) {
-        firstLine = secondLine;
-        secondLine = '';
-      }
-
-      if (!firstLine && !secondLine) continue;
-
-      // Single cue with both languages separated by a line break.
-      // Optionally italicize one language for visual distinction.
       lines.push(vttTime);
-      const sanitizedFirst = sanitizeSubtitleText(firstLine);
-      if (secondLine) {
-        const sanitizedSecond = sanitizeSubtitleText(secondLine);
-        if (italic) {
-          // Determine which line to italicize based on config
-          // firstLine is source when srcTop, target when !srcTop
-          const italicizeFirst = (srcTop && italicTarget === 'source') || (!srcTop && italicTarget === 'target');
-          if (italicizeFirst) {
-            lines.push(`<i>${sanitizedFirst}</i>\n${sanitizedSecond}`);
-          } else {
-            lines.push(`${sanitizedFirst}\n<i>${sanitizedSecond}</i>`);
-          }
-        } else {
-          lines.push(`${sanitizedFirst}\n${sanitizedSecond}`);
-        }
-      } else {
-        lines.push(sanitizedFirst);
+
+      if (sText && tText && !tText.includes('TRANSLATION IN PROGRESS')) {
+        // Inggris: Bold Putih | Indo: Italic, Size 2, Abu-abu (#E2E8F0)
+        lines.push(`<b>${sText}</b>\n<i><font size="2" color="#E2E8F0">${tText}</font></i>`);
+      } else if (sText) {
+        lines.push(`<b>${sText}</b>`);
+      } else if (tText) {
+        lines.push(`<i><font size="2" color="#E2E8F0">${tText}</font></i>`);
       }
+
       lines.push('');
     }
 
-    // If we had a status tail that wasn't consumed in the main loop (e.g., no translations yet),
-    // render it here so users still see progress without extra source lines mixed in.
-    if (hasStatusTail && (count === 0 || statusIndex >= count)) {
-      const statusEntry = trgEntries[statusIndex];
-      const fallbackTime = srcEntries[count - 1]?.timecode || '00:00:00,000 --> 04:00:00,000';
-      const vttTime = srtTimeToVttTime(statusEntry.timecode || fallbackTime);
-      lines.push(vttTime);
-      lines.push(sanitizeSubtitleText(statusEntry.text));
-      lines.push('');
-    }
-
-    if (count === 0 && !hasStatusTail) {
-      // Fallback minimal cue
+    if (count === 0) {
       lines.push('00:00:00.000 --> 04:00:00.000');
       lines.push('No content available');
       lines.push('');
@@ -479,7 +406,6 @@ function srtPairToWebVTT(sourceSrt, targetSrt, order = 'source-top', placement =
 
     return lines.join('\n');
   } catch (_) {
-    // Simple fallback VTT
     return 'WEBVTT\n\n00:00:00.000 --> 04:00:00.000\nLearn Mode: Unable to build VTT';
   }
 }
@@ -508,12 +434,10 @@ function normalizeImdbId(id) {
 
   const idStr = String(id).trim();
 
-  // If it already has 'tt' prefix, return as is
   if (idStr.startsWith('tt')) {
     return idStr;
   }
 
-  // If it's just numbers, add 'tt' prefix
   if (/^\d+$/.test(idStr)) {
     return `tt${idStr}`;
   }
@@ -537,14 +461,6 @@ const SUPPORTED_ANIME_PREFIXES = new Set([
   'anisearch'
 ]);
 
-/**
- * Classify whether a Stremio ID is supported by SubMaker before deeper parsing.
- * This lets the server log filtered-out requests instead of relying on manifest
- * `idPrefixes`, which causes Stremio to skip the addon entirely client-side.
- *
- * @param {string} id - Raw Stremio video ID
- * @returns {{ raw: string, rawPrefix: string, canonicalPrefix: string, supported: boolean, reasonCode: string, reason: string }}
- */
 function inspectStremioIdSupport(id) {
   if (!id) {
     return {
@@ -651,12 +567,6 @@ function inspectStremioIdSupport(id) {
   };
 }
 
-/**
- * Extract video info from Stremio ID
- * @param {string} id - Stremio video ID (e.g., "tt1234567:1:2" for episode, "anidb:123:1:2" for anime, "tmdb:1234" for TMDB)
- * @param {string} [stremioType] - Optional Stremio meta type hint ("movie" or "series")
- * @returns {Object|null} - Parsed video info
- */
 function parseStremioId(id, stremioType) {
   if (!id) return null;
 
@@ -666,21 +576,15 @@ function parseStremioId(id, stremioType) {
   const parts = raw.split(':');
   const prefix = String(parts[0] || '').toLowerCase();
 
-  // Handle TMDB IDs (movie or TV/episode)
   if (prefix === 'tmdb') {
     const tmdbId = String(parts[1] || '').trim();
     if (!/^\d+$/.test(tmdbId)) return null;
 
-    // Derive media type from Stremio meta type when available
     const tmdbMediaType = stremioType === 'series' ? 'tv'
       : stremioType === 'movie' ? 'movie'
       : undefined;
 
     if (parts.length === 2) {
-      // tmdb:{id} with no season/episode — could be movie or series
-      // Use stremioType hint for tmdbMediaType (drives Cinemeta lookup type),
-      // but keep parsed type as 'movie' since providers need season/episode
-      // for series queries and we don't have them here
       return {
         tmdbId,
         tmdbMediaType,
@@ -689,7 +593,6 @@ function parseStremioId(id, stremioType) {
     }
 
     if (parts.length === 3) {
-      // Episode with implicit season 1: tmdb:{id}:{episode}
       const episode = parseInt(parts[2], 10);
       if (!Number.isFinite(episode) || episode <= 0) return null;
       return {
@@ -702,7 +605,6 @@ function parseStremioId(id, stremioType) {
     }
 
     if (parts.length === 4) {
-      // Episode with season: tmdb:{id}:{season}:{episode}
       const season = parseInt(parts[2], 10);
       const episode = parseInt(parts[3], 10);
       if (!Number.isFinite(season) || season <= 0 || !Number.isFinite(episode) || episode <= 0) return null;
@@ -716,7 +618,6 @@ function parseStremioId(id, stremioType) {
     }
   }
 
-  // Handle anime IDs (extended compatibility with common anime catalog prefixes)
   if (parts[0] && SUPPORTED_ANIME_PREFIXES.has(prefix)) {
     const canonicalAnimePrefix = ANIME_PREFIX_ALIASES[prefix] || prefix;
     const animeIdType = canonicalAnimePrefix;
@@ -724,43 +625,35 @@ function parseStremioId(id, stremioType) {
     if (!/^\d+$/.test(animeRawId)) return null;
 
     if (parts.length === 2) {
-      // Anime movie or series (format: platform:id)
-      // Example: kitsu:8640 -> platform=kitsu, id=8640
-      const animeId = `${canonicalAnimePrefix}:${animeRawId}`; // Full ID with canonical platform prefix
+      const animeId = `${canonicalAnimePrefix}:${animeRawId}`;
       return {
         animeId,
         animeIdType,
         type: 'anime',
         isAnime: true,
-        // Keep anidbId for backward compatibility if it's an AniDB ID
         ...(animeIdType === 'anidb' && { anidbId: animeId })
       };
     }
 
     if (parts.length === 3) {
-      // Anime episode (format: platform:id:episode)
-      // Example: kitsu:8640:2 -> platform=kitsu, id=8640, episode=2
       const episode = parseInt(parts[2], 10);
       if (!Number.isFinite(episode) || episode <= 0) return null;
-      const animeId = `${canonicalAnimePrefix}:${animeRawId}`; // Full ID with canonical platform prefix
+      const animeId = `${canonicalAnimePrefix}:${animeRawId}`;
       return {
         animeId,
         animeIdType,
         type: 'anime-episode',
         episode,
         isAnime: true,
-        // Keep anidbId for backward compatibility if it's an AniDB ID
         ...(animeIdType === 'anidb' && { anidbId: animeId })
       };
     }
 
     if (parts.length === 4) {
-      // Anime episode with season (format: platform:id:season:episode)
-      // Example: kitsu:8640:1:2 -> platform=kitsu, id=8640, season=1, episode=2
       const season = parseInt(parts[2], 10);
       const episode = parseInt(parts[3], 10);
       if (!Number.isFinite(season) || season <= 0 || !Number.isFinite(episode) || episode <= 0) return null;
-      const animeId = `${canonicalAnimePrefix}:${animeRawId}`; // Full ID with canonical platform prefix
+      const animeId = `${canonicalAnimePrefix}:${animeRawId}`;
       return {
         animeId,
         animeIdType,
@@ -768,7 +661,6 @@ function parseStremioId(id, stremioType) {
         season,
         episode,
         isAnime: true,
-        // Keep anidbId for backward compatibility if it's an AniDB ID
         ...(animeIdType === 'anidb' && { anidbId: animeId })
       };
     }
@@ -776,19 +668,16 @@ function parseStremioId(id, stremioType) {
     return null;
   }
 
-  // Fail closed for unknown prefixed IDs instead of coercing them into fake IMDB IDs.
   if (parts.length > 1 && prefix && !/^tt\d+$/i.test(prefix)) {
     return null;
   }
 
-  // Handle IMDB IDs (regular content)
   const imdbBase = String(parts[0] || '').trim();
   const imdbId = normalizeImdbId(imdbBase);
   const isImdbLike = /^tt\d{3,}$/i.test(imdbId);
   if (!isImdbLike) return null;
 
   if (parts.length === 1) {
-    // Movie
     return {
       imdbId,
       type: 'movie'
@@ -796,8 +685,6 @@ function parseStremioId(id, stremioType) {
   }
 
   if (parts.length === 2) {
-    // IMDB ID with single numeric part — treat as episode with implicit season 1
-    // e.g., tt1234567:5 -> season 1, episode 5
     const episodeNum = parseInt(parts[1], 10);
     if (!isNaN(episodeNum)) {
       return {
@@ -811,7 +698,6 @@ function parseStremioId(id, stremioType) {
   }
 
   if (parts.length === 3) {
-    // TV Episode
     const season = parseInt(parts[1], 10);
     const episode = parseInt(parts[2], 10);
     if (!Number.isFinite(season) || season <= 0 || !Number.isFinite(episode) || episode <= 0) return null;
@@ -826,28 +712,16 @@ function parseStremioId(id, stremioType) {
   return null;
 }
 
-/**
- * Create a subtitle URL for Stremio
- * @param {string} id - Subtitle ID
- * @param {string} lang - Language code
- * @param {string} baseUrl - Base URL of the addon
- * @returns {string} - Subtitle URL
- */
 function createSubtitleUrl(id, lang, baseUrl) {
   return `${baseUrl}/subtitle/${encodeURIComponent(id)}/${lang}.srt`;
 }
 
-/**
- * Sanitize subtitle text (remove unwanted characters, fix encoding issues)
- * @param {string} text - Subtitle text
- * @returns {string} - Sanitized text
- */
 function sanitizeSubtitleText(text) {
   if (!text) return '';
 
   return text
-    .replace(/\r\n/g, '\n') // Normalize line endings
-    .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '') // Remove control characters
+    .replace(/\r\n/g, '\n')
+    .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '')
     .trim();
 }
 
