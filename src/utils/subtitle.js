@@ -124,7 +124,6 @@ function convertToSRT(content, logPrefix = '[SRT Conversion]') {
   }
 
   // Unknown format — try generic subsrt-ts conversion as last resort
-  // Apply ASS preprocessor in case format detection missed an ASS/SSA variant (fixes subsrt-ts first-letter bug)
   try {
     const subsrt = require('subsrt-ts');
     const assConverter = require('./assConverter');
@@ -363,6 +362,7 @@ function srtDurationMs(tc) {
 
 /**
  * Custom Dual Subtitle Formatter:
+ * Menghapus enter/line break bawaan agar tiap bahasa tampil 1 baris rata.
  * Baris 1: English Bold (Putih)
  * Baris 2: Indonesian Italic Small (Abu-abu Cerah)
  */
@@ -381,13 +381,13 @@ function srtPairToWebVTT(sourceSrt, targetSrt, order = 'source-top', placement =
       let chosenTimecode = (s && s.timecode) || (t && t.timecode) || '00:00:00,000 --> 00:00:05,000';
       const vttTime = srtTimeToVttTime(chosenTimecode);
 
-      const sText = sanitizeSubtitleText(s?.text || '');
-      const tText = sanitizeSubtitleText(t?.text || '');
+      // Hapus semua enter/newline bawaan agar teks tidak terlipat dua
+      const sText = sanitizeSubtitleText(s?.text || '').replace(/\s*\n\s*/g, ' ').trim();
+      const tText = sanitizeSubtitleText(t?.text || '').replace(/\s*\n\s*/g, ' ').trim();
 
       lines.push(vttTime);
 
       if (sText && tText && !tText.includes('TRANSLATION IN PROGRESS')) {
-        // Inggris: Bold Putih | Indo: Italic, Size 2, Abu-abu (#E2E8F0)
         lines.push(`<b>${sText}</b>\n<i><font size="2" color="#E2E8F0">${tText}</font></i>`);
       } else if (sText) {
         lines.push(`<b>${sText}</b>`);
