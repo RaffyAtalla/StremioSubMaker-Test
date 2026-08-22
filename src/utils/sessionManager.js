@@ -394,6 +394,9 @@ async function getPubSubClient() {
     try {
         const sentinelEnabled = process.env.REDIS_SENTINEL_ENABLED === 'true';
         const password = getRedisPassword() || undefined;
+        // Enable TLS when REDIS_TLS=true (required by managed providers like
+        // Upstash, Redis Cloud, etc. that only accept encrypted connections).
+        const useTls = process.env.REDIS_TLS === 'true';
         let clientOptions;
 
         if (sentinelEnabled) {
@@ -412,6 +415,7 @@ async function getPubSubClient() {
                 password,
                 db: process.env.REDIS_DB ? parseInt(process.env.REDIS_DB, 10) : 0,
                 keyPrefix: '',
+                tls: useTls ? {} : undefined,
                 maxRetriesPerRequest: 3,
                 retryStrategy: (times) => Math.min(times * 50, 2000),
                 sentinelRetryStrategy: (times) => Math.min(times * 100, 3000)
@@ -423,6 +427,7 @@ async function getPubSubClient() {
                 password,
                 db: process.env.REDIS_DB ? parseInt(process.env.REDIS_DB, 10) : 0,
                 keyPrefix: '',
+                tls: useTls ? {} : undefined,
                 maxRetriesPerRequest: 3,
                 retryStrategy: (times) => Math.min(times * 50, 2000)
             };
@@ -455,6 +460,9 @@ async function getPublishClient() {
     try {
         const sentinelEnabled = process.env.REDIS_SENTINEL_ENABLED === 'true';
         const password = getRedisPassword() || undefined;
+        // Enable TLS when REDIS_TLS=true (required by managed providers like
+        // Upstash, Redis Cloud, etc. that only accept encrypted connections).
+        const useTls = process.env.REDIS_TLS === 'true';
         let clientOptions;
 
         if (sentinelEnabled) {
@@ -473,6 +481,7 @@ async function getPublishClient() {
                 password,
                 db: process.env.REDIS_DB ? parseInt(process.env.REDIS_DB, 10) : 0,
                 keyPrefix: '',
+                tls: useTls ? {} : undefined,
                 maxRetriesPerRequest: 3,
                 retryStrategy: (times) => Math.min(times * 50, 2000),
                 sentinelRetryStrategy: (times) => Math.min(times * 100, 3000)
@@ -484,6 +493,7 @@ async function getPublishClient() {
                 password,
                 db: process.env.REDIS_DB ? parseInt(process.env.REDIS_DB, 10) : 0,
                 keyPrefix: '',
+                tls: useTls ? {} : undefined,
                 maxRetriesPerRequest: 3,
                 retryStrategy: (times) => Math.min(times * 50, 2000)
             };
