@@ -19,7 +19,6 @@ const DECRYPTED_CACHE_TTL_MS = 5 * 60 * 1000;
 const STORAGE_COUNT_CACHE_TTL_MS = 5 * 60 * 1000;
 const TTL_REFRESH_DEBOUNCE_MS = 60 * 60 * 1000;
 const SESSION_INDEX_VERIFY_INTERVAL_MS = 3 * 60 * 60 * 1000;
-const SESSION_INDEX_MISMATCH_LOG_LEVEL = 'error';
 
 const FAILED_LOOKUP_MAX = 10;
 const FAILED_LOOKUP_WINDOW_MS = 60 * 1000;
@@ -91,23 +90,6 @@ function sanitizeHistoryComponent(value) {
     .slice(0, 200);
 }
 
-function normalizeHistoryUserHash(value) {
-  return sanitizeHistoryComponent(value) || '';
-}
-
-function buildHistoryStoreKey(userHash) {
-  return `histset__${sanitizeHistoryComponent(userHash)}`;
-}
-
-function buildHistoryIndexKey(userHash) {
-  return `histidx__${sanitizeHistoryComponent(userHash)}`;
-}
-
-function buildHistoryPatterns(userHash) {
-  const safeHash = sanitizeHistoryComponent(userHash);
-  return [`hist__${safeHash}__*`, `hist_${safeHash}_*`, `hist:${safeHash}:*`];
-}
-
 function computeIntegrityHash(token, fingerprint) {
   try {
     return crypto.createHash('sha256').update(String(token || '')).update('|').update(String(fingerprint || '')).digest('hex').slice(0, 24);
@@ -156,59 +138,6 @@ function cloneConfig(config) {
   }
 }
 
-function ensureTokenMetadata(sessionData, token) {
-  if (!sessionData) return { status: 'invalid' };
-  const expectedTokenFingerprint = computeTokenFingerprint(token);
-  if (!sessionData.token) return { status: 'missing_token' };
-  if (sessionData.token !== token) return { status: 'mismatch_token', storedToken: sessionData.token };
-  if (!sessionData.tokenFingerprint) return { status: 'missing_fingerprint', expectedTokenFingerprint };
-  if (sessionData.tokenFingerprint !== expectedTokenFingerprint) {
-    return { status: 'mismatch_fingerprint', storedTokenFingerprint: sessionData.tokenFingerprint, expectedTokenFingerprint };
-  }
-  return { status: 'ok' };
-}
-
-function validateEncryptedSessionPayload(sessionData) {
-  if (!sessionData || typeof sessionData !== 'object') return { valid: false, reason: 'not_object' };
-  const { config } = sessionData;
-  if (!config || typeof config !== 'object') return { valid: false, reason: 'missing_config' };
-  return {
-    valid: true,
-    unencryptedConfig: config._encrypted !== true,
-    missingFingerprint: typeof sessionData.fingerprint !== 'string' || sessionData.fingerprint.length === 0,
-    missingIntegrity: typeof sessionData.integrity !== 'string' || sessionData.integrity.length === 0
-  };
-}
-
-function normalizeSessionLifecycleMetadata(sessionData) {
-  if (!sessionData || typeof sessionData !== 'object') return false;
-  let changed = false;
-  const now = Date.now();
-  const createdAt = Number(sessionData.createdAt);
-  const normalizedCreatedAt = Number.isFinite(createdAt) && createdAt > 0 ? createdAt : now;
-  if (sessionData.createdAt !== normalizedCreatedAt) { sessionData.createdAt = normalizedCreatedAt; changed = true; }
-
-  const updatedAt = Number(sessionData.updatedAt);
-  const normalizedUpdatedAt = Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : normalizedCreatedAt;
-  if (sessionData.updatedAt !== normalizedUpdatedAt) { sessionData.updatedAt = normalizedUpdatedAt; changed = true; }
-
-  const disabled = sessionData.disabled === true || sessionData.status === 'disabled';
-  if (sessionData.disabled !== disabled) { sessionData.disabled = disabled; changed = true; }
-
-  if (disabled) {
-    const disabledAt = Number(sessionData.disabledAt);
-    const normalizedDisabledAt = Number.isFinite(disabledAt) && disabledAt > 0 ? disabledAt : normalizedUpdatedAt;
-    if (sessionData.disabledAt !== normalizedDisabledAt) { sessionData.disabledAt = normalizedDisabledAt; changed = true; }
-  } else if (sessionData.disabledAt !== null) {
-    sessionData.disabledAt = null;
-    changed = true;
-  }
-  return changed;
-}
-
-/**
- * Helper Dekode Stateless Config dari Token URL
- */
 function tryDecodeStatelessToken(token) {
   if (!token) return null;
   try {
@@ -233,63 +162,6 @@ async function getStorageAdapter() {
     storageAdapter = await StorageFactory.getStorageAdapter();
   }
   return storageAdapter;
-}
-
-let pubSubClient = null;
-let publishClient = null;
-
-function getPrefixVariants() {
-  const configured = process.env.REDIS_KEY_PREFIX || 'stremio';
-  const extra = (process.env.REDIS_KEY_PREFIX_VARIANTS || '').split(',').map(s => s.trim()).filter(Boolean);
-  const bases = [configured, ...extra];
-  const variants = new Set(['']);
-  for (const base of bases) {
-    variants.add(base.endsWith(':') ? base : `${base}:`);
-    variants.add(base.endsWith(':') ? base.slice(0, -1) : base);
-  }
-  return Array.from(variants).filter(Boolean);
-}
-
-async function getPubSubClient() {
-  if ((process.env.STORAGE_TYPE || 'redis') !== 'redis') return null;
-  if (pubSubClient) return pubSubClient;
-  try {
-    const password = getRedisPassword() || undefined;
-    pubSubClient = new Redis({
-      host: process.env.REDIS_HOST || 'localhost',
-      port: process.env.REDIS_PORT || 6379,
-      password,
-      db: process.env.REDIS_DB ? parseInt(process.env.REDIS_DB, 10) : 0,
-      keyPrefix: '',
-      maxRetriesPerRequest: 3,
-      retryStrategy: (times) => Math.min(times * 50, 2000)
-    });
-    pubSubClient.on('error', (err) => log.error(() => ['[SessionManager] Pub/Sub client error:', err.message]));
-    return pubSubClient;
-  } catch (err) {
-    return null;
-  }
-}
-
-async function getPublishClient() {
-  if ((process.env.STORAGE_TYPE || 'redis') !== 'redis') return null;
-  if (publishClient) return publishClient;
-  try {
-    const password = getRedisPassword() || undefined;
-    publishClient = new Redis({
-      host: process.env.REDIS_HOST || 'localhost',
-      port: process.env.REDIS_PORT || 6379,
-      password,
-      db: process.env.REDIS_DB ? parseInt(process.env.REDIS_DB, 10) : 0,
-      keyPrefix: '',
-      maxRetriesPerRequest: 3,
-      retryStrategy: (times) => Math.min(times * 50, 2000)
-    });
-    publishClient.on('error', (err) => log.error(() => ['[SessionManager] Publish client error:', err.message]));
-    return publishClient;
-  } catch (err) {
-    return null;
-  }
 }
 
 class SessionManager extends EventEmitter {
@@ -346,6 +218,13 @@ class SessionManager extends EventEmitter {
     this.loadingPromise = this._initializeSessions();
     this.startAutoSave();
     this.startMemoryCleanup();
+  }
+
+  async waitUntilReady() {
+    if (this.isReady) return;
+    if (this.loadingPromise) {
+      await this.loadingPromise;
+    }
   }
 
   _calculateTtlSeconds() {
@@ -438,7 +317,6 @@ class SessionManager extends EventEmitter {
       const loadedConfig = await this.loadSessionFromStorage(token);
       if (loadedConfig) return loadedConfig;
 
-      // RECOVERY: Jika session hilang di RAM/Storage, dekode langsung dari token
       const recoveredStateless = tryDecodeStatelessToken(token);
       if (recoveredStateless) {
         log.warn(() => `[SessionManager] Recovered stateless config from token ${redactToken(token)}`);
@@ -466,7 +344,6 @@ class SessionManager extends EventEmitter {
       }
     } catch (err) { }
 
-    // Backup Recovery
     const recoveredStateless = tryDecodeStatelessToken(token);
     if (recoveredStateless) return recoveredStateless;
 
@@ -562,6 +439,8 @@ class SessionManager extends EventEmitter {
     this.decryptedCache.delete(token);
     return existed;
   }
+
+  setupShutdownHandlers(server) { }
 }
 
 let instance = null;
