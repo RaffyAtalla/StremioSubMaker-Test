@@ -14,7 +14,6 @@ function detectASSFormat(content) {
     return { isASS: false, format: null };
   }
   const trimmed = content.trimStart();
-  // ASS uses [V4+ Styles], SSA uses [V4 Styles]
   const hasScriptInfo = /\[script info\]/i.test(trimmed);
   const hasEvents = /\[events\]/i.test(trimmed);
   const hasDialogue = /^dialogue\s*:/im.test(trimmed);
@@ -22,7 +21,6 @@ function detectASSFormat(content) {
   const hasV4 = /\[v4\s+styles\]/i.test(trimmed);
 
   if (hasScriptInfo || hasEvents || hasDialogue) {
-    // SSA uses [V4 Styles] (no plus), ASS uses [V4+ Styles]
     const format = (hasV4 && !hasV4Plus) ? 'ssa' : 'ass';
     return { isASS: true, format };
   }
@@ -31,12 +29,6 @@ function detectASSFormat(content) {
 
 /**
  * Convert subtitle content from any supported format to SRT.
- * Handles ASS/SSA → VTT → SRT, VTT → SRT, and SRT passthrough.
- * Uses a multi-strategy fallback chain for ASS/SSA conversion.
- *
- * @param {string} content - Subtitle content in any supported format (SRT, VTT, ASS, SSA)
- * @param {string} [logPrefix='[SRT Conversion]'] - Log prefix for debug messages
- * @returns {string} - SRT-formatted content (best effort; returns original on total failure)
  */
 function convertToSRT(content, logPrefix = '[SRT Conversion]') {
   if (!content || typeof content !== 'string') {
@@ -45,12 +37,10 @@ function convertToSRT(content, logPrefix = '[SRT Conversion]') {
 
   const trimmed = content.trimStart();
 
-  // Already SRT — pass through (SRT starts with a numeric index line)
   if (/^\d+\s*[\r\n]/.test(trimmed)) {
     return content;
   }
 
-  // VTT → SRT
   if (trimmed.startsWith('WEBVTT')) {
     try {
       const subsrt = require('subsrt-ts');
@@ -67,12 +57,10 @@ function convertToSRT(content, logPrefix = '[SRT Conversion]') {
     return content;
   }
 
-  // ASS/SSA → SRT (multi-strategy fallback)
   const { isASS, format } = detectASSFormat(content);
   if (isASS) {
     log.debug(() => `${logPrefix} Detected ${(format || 'ass').toUpperCase()} subtitle, converting to SRT`);
 
-    // Strategy 1: Enhanced converter (preprocessASS → subsrt-ts → postprocessVTT) then VTT→SRT
     try {
       const assConverter = require('./assConverter');
       const vttResult = assConverter.convertASSToVTT(content, format || 'ass');
@@ -92,7 +80,6 @@ function convertToSRT(content, logPrefix = '[SRT Conversion]') {
       log.warn(() => [`${logPrefix} Enhanced ASS/SSA converter threw:`, e.message]);
     }
 
-    // Strategy 2: Direct subsrt-ts ASS/SSA → SRT (with preprocessor fix for first-letter bug)
     try {
       const subsrt = require('subsrt-ts');
       const assConverter = require('./assConverter');
@@ -108,7 +95,6 @@ function convertToSRT(content, logPrefix = '[SRT Conversion]') {
       log.warn(() => [`${logPrefix} Direct subsrt-ts ASS/SSA → SRT failed:`, e.message]);
     }
 
-    // Strategy 3: Manual ASS parser → SRT (last resort)
     try {
       const manualResult = manualAssToSrt(content);
       if (manualResult) {
@@ -123,7 +109,6 @@ function convertToSRT(content, logPrefix = '[SRT Conversion]') {
     return content;
   }
 
-  // Unknown format — try generic subsrt-ts conversion as last resort
   try {
     const subsrt = require('subsrt-ts');
     const assConverter = require('./assConverter');
@@ -140,24 +125,10 @@ function convertToSRT(content, logPrefix = '[SRT Conversion]') {
   return content;
 }
 
-/**
- * Ensure subtitle content is in SRT format for translation.
- * Thin wrapper around convertToSRT with a translation-specific log prefix.
- *
- * @param {string} content - Subtitle content in any supported format
- * @param {string} [logPrefix='[Translation]'] - Log prefix for debug messages
- * @returns {string} - SRT-formatted content (best effort; returns original on total failure)
- */
 function ensureSRTForTranslation(content, logPrefix = '[Translation]') {
   return convertToSRT(content, logPrefix);
 }
 
-/**
- * Manual ASS/SSA to SRT converter (last-resort fallback).
- * Parses Dialogue lines directly and produces SRT output.
- * @param {string} input - Raw ASS/SSA content
- * @returns {string|null} - SRT content or null on failure
- */
 function manualAssToSrt(input) {
   if (!input || !/\[events\]/i.test(input)) return null;
 
@@ -235,11 +206,6 @@ function manualAssToSrt(input) {
   ).join('\n\n');
 }
 
-/**
- * Parse SRT subtitle content into structured format
- * @param {string} srtContent - SRT formatted subtitle content
- * @returns {Array} - Array of subtitle entries
- */
 function parseSRT(srtContent) {
   if (!srtContent || typeof srtContent !== 'string') {
     return [];
@@ -276,14 +242,6 @@ function escapeRegExp(str) {
   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/**
- * Append an informational note as a hidden (>4h) cue and ensure minimum length
- * so heuristic filters keep the subtitle while keeping the note off-screen.
- * @param {string} srtContent - Base SRT content
- * @param {string} note - Informational note to include in hidden cue
- * @param {number} minLength - Minimum total length to enforce
- * @returns {string}
- */
 function appendHiddenInformationalNote(srtContent, note = DEFAULT_INFO_SUBTITLE_NOTE, minLength = MIN_INFO_SUBTITLE_LENGTH) {
   try {
     const base = typeof srtContent === 'string' ? srtContent : String(srtContent || '');
@@ -315,11 +273,6 @@ function appendHiddenInformationalNote(srtContent, note = DEFAULT_INFO_SUBTITLE_
   }
 }
 
-/**
- * Convert parsed subtitle entries back to SRT format
- * @param {Array} entries - Array of subtitle entries
- * @returns {string} - SRT formatted content
- */
 function toSRT(entries) {
   return entries
     .map(entry => {
@@ -329,11 +282,6 @@ function toSRT(entries) {
     .join('\n\n') + '\n';
 }
 
-/**
- * Normalize SRT cue numbering to 1..N while preserving timing/text.
- * @param {string} srtContent - SRT content
- * @returns {string} - Renumbered SRT content
- */
 function normalizeSRTIndices(srtContent) {
   const entries = parseSRT(srtContent);
   if (!entries.length) {
@@ -346,9 +294,6 @@ function normalizeSRTIndices(srtContent) {
   })));
 }
 
-/**
- * Convert SRT time (HH:MM:SS,mmm) to VTT time (HH:MM:SS.mmm)
- */
 function srtTimeToVttTime(tc) {
   return String(tc || '').replace(/,/g, '.');
 }
@@ -361,10 +306,25 @@ function srtDurationMs(tc) {
 }
 
 /**
+ * Helper: Merajut ulang teks subtitle secara cerdas tanpa membuang dialog dua orang
+ */
+function cleanAndFormatText(text) {
+  if (!text) return '';
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  
+  // Jika baris mengandung tanda dialog (-), jaga ketersediaan enter antar dialog
+  const hasMultipleDialogues = lines.length > 1 && lines.some(l => l.startsWith('-'));
+  if (hasMultipleDialogues) {
+    return lines.join('\n');
+  }
+  
+  // Jika hanya kalimat sambung biasa, lebur menjadi 1 baris rata
+  return lines.join(' ');
+}
+
+/**
  * Custom Dual Subtitle Formatter:
- * Menghapus enter/line break bawaan agar tiap bahasa tampil 1 baris rata.
- * Baris 1: English Bold (Putih)
- * Baris 2: Indonesian Italic Small (Abu-abu Cerah)
+ * Menjaga keutuhan teks dialog ganda sekaligus merapikan tampilan
  */
 function srtPairToWebVTT(sourceSrt, targetSrt, order = 'source-top', placement = 'stacked', options = {}) {
   try {
@@ -381,9 +341,8 @@ function srtPairToWebVTT(sourceSrt, targetSrt, order = 'source-top', placement =
       let chosenTimecode = (s && s.timecode) || (t && t.timecode) || '00:00:00,000 --> 00:00:05,000';
       const vttTime = srtTimeToVttTime(chosenTimecode);
 
-      // Hapus semua enter/newline bawaan agar teks tidak terlipat dua
-      const sText = sanitizeSubtitleText(s?.text || '').replace(/\s*\n\s*/g, ' ').trim();
-      const tText = sanitizeSubtitleText(t?.text || '').replace(/\s*\n\s*/g, ' ').trim();
+      const sText = cleanAndFormatText(sanitizeSubtitleText(s?.text || ''));
+      const tText = cleanAndFormatText(sanitizeSubtitleText(t?.text || ''));
 
       lines.push(vttTime);
 
@@ -410,11 +369,6 @@ function srtPairToWebVTT(sourceSrt, targetSrt, order = 'source-top', placement =
   }
 }
 
-/**
- * Validate SRT subtitle content
- * @param {string} srtContent - SRT content to validate
- * @returns {boolean} - True if valid SRT format
- */
 function validateSRT(srtContent) {
   if (!srtContent || typeof srtContent !== 'string') {
     return false;
@@ -424,11 +378,6 @@ function validateSRT(srtContent) {
   return entries.length > 0;
 }
 
-/**
- * Extract IMDB ID from various formats
- * @param {string} id - ID in various formats (tt1234567, 1234567, etc.)
- * @returns {string} - Normalized IMDB ID with 'tt' prefix
- */
 function normalizeImdbId(id) {
   if (!id) return null;
 
