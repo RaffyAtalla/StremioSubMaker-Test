@@ -3,23 +3,13 @@ const { EventEmitter } = require('events');
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
-const Redis = require('ioredis');
 const { StorageFactory, StorageAdapter } = require('../storage');
-const { StorageUnavailableError } = require('../storage/errors');
 const log = require('./logger');
-const { shutdownLogger } = require('./logger');
-const sentry = require('./sentry');
-const { handleCaughtError } = require('./errorClassifier');
-const { encryptUserConfig, decryptUserConfig, normalizeSensitiveInputsForStorage, getDecryptionWarnings } = require('./encryption');
+const { encryptUserConfig, decryptUserConfig, normalizeSensitiveInputsForStorage } = require('./encryption');
 const { redactToken } = require('./security');
-const { getRedisPassword } = require('./redisHelper');
-const { MAX_SESSION_BRIEF_BATCH, SESSION_BRIEF_LOOKUP_CONCURRENCY, normalizeSessionBriefTokens } = require('./sessionBriefBatch');
+const { MAX_SESSION_BRIEF_BATCH, normalizeSessionBriefTokens } = require('./sessionBriefBatch');
 
 const DECRYPTED_CACHE_TTL_MS = 5 * 60 * 1000;
-const STORAGE_COUNT_CACHE_TTL_MS = 5 * 60 * 1000;
-const TTL_REFRESH_DEBOUNCE_MS = 60 * 60 * 1000;
-const SESSION_INDEX_VERIFY_INTERVAL_MS = 3 * 60 * 60 * 1000;
-
 const FAILED_LOOKUP_MAX = 10;
 const FAILED_LOOKUP_WINDOW_MS = 60 * 1000;
 const FAILED_LOOKUP_BLOCK_MS = 5 * 60 * 1000;
@@ -81,13 +71,6 @@ function computeTokenFingerprint(token) {
 
 function computeHistoryUserHash(token) {
   return `sesshist_${computeTokenFingerprint(token)}`;
-}
-
-function sanitizeHistoryComponent(value) {
-  return String(value || '')
-    .trim()
-    .replace(/[^a-zA-Z0-9_-]/g, '_')
-    .slice(0, 200);
 }
 
 function computeIntegrityHash(token, fingerprint) {
@@ -170,89 +153,44 @@ class SessionManager extends EventEmitter {
     this.instanceId = crypto.randomBytes(8).toString('hex');
     this.maxSessions = (Number.isFinite(options.maxSessions) && options.maxSessions > 0) ? options.maxSessions : null;
     this.maxAge = options.maxAge || 90 * 24 * 60 * 60 * 1000;
-    this.redisTtlEnabled = String(process.env.SESSION_REDIS_TTL_ENABLED || 'true').toLowerCase() === 'true';
-    this.snapshotEnabled = String(process.env.SESSION_SNAPSHOT_ENABLED || '').toLowerCase() === 'true';
     this.persistencePath = options.persistencePath || path.join(process.cwd(), 'data', 'sessions.json');
-    this.snapshotPath = process.env.SESSION_SNAPSHOT_PATH || this.persistencePath;
-    this.autoSaveInterval = options.autoSaveInterval || 60 * 1000;
-    this.shutdownTimeout = options.shutdownTimeout || 10 * 1000;
-
-    this.storageMaxSessions = (Number.isFinite(options.storageMaxSessions) && options.storageMaxSessions > 0) ? options.storageMaxSessions : null;
-    this.storageMaxAge = options.storageMaxAge || 90 * 24 * 60 * 60 * 1000;
-
-    this.lastStorageCount = 0;
-    this.lastEvictionCount = 0;
-    this.evictionHistory = [];
-    this.storageCountCache = { value: 0, ts: 0 };
-
+    
     this.ensureDataDir();
 
     const cacheOptions = {
       ttl: this.maxAge,
       updateAgeOnGet: true,
-      updateAgeOnHas: false,
-      dispose: (value, key) => {
-        this.lastEvictionCount++;
-      }
+      updateAgeOnHas: false
     };
     if (this.maxSessions) cacheOptions.max = this.maxSessions;
     this.cache = new LRUCache(cacheOptions);
 
-    const decryptedTtl = Math.min(this.maxAge || Infinity, DECRYPTED_CACHE_TTL_MS);
     this.decryptedCache = new LRUCache({
       max: this.maxSessions || 30000,
-      ttl: Number.isFinite(decryptedTtl) ? decryptedTtl : DECRYPTED_CACHE_TTL_MS,
+      ttl: DECRYPTED_CACHE_TTL_MS,
       updateAgeOnGet: true
     });
 
     this.failedLookups = new LRUCache({ max: 10000, ttl: FAILED_LOOKUP_BLOCK_MS });
-    this.saveTimer = null;
-    this.cleanupTimer = null;
-    this.sessionIndexVerifyTimer = null;
-    this.dirty = false;
-    this.consecutiveSaveFailures = 0;
-    this.isReady = false;
-    this.loadingPromise = null;
-    this.pendingPersistence = new Set();
-
-    this.loadingPromise = this._initializeSessions();
-    this.startAutoSave();
-    this.startMemoryCleanup();
+    this.isReady = true;
   }
 
   async waitUntilReady() {
-    if (this.isReady) return;
-    if (this.loadingPromise) {
-      await this.loadingPromise;
-    }
+    return true;
   }
 
-  _calculateTtlSeconds() {
-    if (!this.redisTtlEnabled) return null;
-    return Number.isFinite(this.maxAge) ? Math.floor(this.maxAge / 1000) : null;
+  getStats() {
+    return {
+      activeSessions: this.cache.size,
+      maxSessions: this.maxSessions || 30000,
+      decryptedCacheSize: this.decryptedCache.size,
+      instanceId: this.instanceId,
+      isReady: this.isReady
+    };
   }
 
-  _trackPersistence(promise) {
-    this.pendingPersistence.add(promise);
-    promise.finally(() => this.pendingPersistence.delete(promise)).catch(() => { });
-    return promise;
-  }
-
-  async _flushPendingPersistence() {
-    if (this.pendingPersistence.size === 0) return;
-    try {
-      await Promise.allSettled(Array.from(this.pendingPersistence));
-    } catch (_) { }
-  }
-
-  async _initializeSessions() {
-    try {
-      await this.loadFromDisk();
-      if (this.snapshotEnabled) await this.restoreFromSnapshotIfStorageEmpty();
-      this.isReady = true;
-    } catch (err) {
-      this.isReady = true;
-    }
+  getMetrics() {
+    return this.getStats();
   }
 
   ensureDataDir() {
@@ -269,43 +207,51 @@ class SessionManager extends EventEmitter {
   }
 
   async createSession(config) {
-    const normalizedConfig = normalizeSensitiveInputsForStorage(stripInternalFlags(cloneConfig(config)));
-    const token = this.generateToken();
-    const tokenFingerprint = computeTokenFingerprint(token);
-    const fingerprint = computeConfigFingerprint(normalizedConfig);
-    const configWithMetadata = embedSessionMetadata(normalizedConfig, token, fingerprint);
-    const encryptedConfig = encryptUserConfig(configWithMetadata);
-    const integrity = computeIntegrityHash(token, fingerprint);
-
-    const now = Date.now();
-    const sessionData = {
-      token,
-      tokenFingerprint,
-      historyUserHash: computeHistoryUserHash(token),
-      config: encryptedConfig,
-      createdAt: now,
-      updatedAt: now,
-      lastAccessedAt: now,
-      disabled: false,
-      disabledAt: null,
-      fingerprint,
-      integrity
-    };
-
-    this.cache.set(token, sessionData);
-    const configForCache = cloneConfig(normalizedConfig);
-    configForCache.__historyUserHash = sessionData.historyUserHash;
-    this.decryptedCache.set(token, configForCache);
-    this.dirty = true;
-
     try {
-      const adapter = await getStorageAdapter();
-      const ttlSeconds = this._calculateTtlSeconds();
-      await adapter.set(token, sessionData, StorageAdapter.CACHE_TYPES.SESSION, ttlSeconds);
-    } catch (err) { }
+      const normalizedConfig = normalizeSensitiveInputsForStorage(stripInternalFlags(cloneConfig(config)));
+      const token = this.generateToken();
+      const tokenFingerprint = computeTokenFingerprint(token);
+      const fingerprint = computeConfigFingerprint(normalizedConfig);
+      const configWithMetadata = embedSessionMetadata(normalizedConfig, token, fingerprint);
+      
+      let encryptedConfig;
+      try {
+        encryptedConfig = encryptUserConfig(configWithMetadata);
+      } catch (encErr) {
+        encryptedConfig = configWithMetadata;
+      }
 
-    this.emit('sessionCreated', { token, source: 'local' });
-    return token;
+      const integrity = computeIntegrityHash(token, fingerprint);
+      const now = Date.now();
+      const sessionData = {
+        token,
+        tokenFingerprint,
+        historyUserHash: computeHistoryUserHash(token),
+        config: encryptedConfig,
+        createdAt: now,
+        updatedAt: now,
+        lastAccessedAt: now,
+        disabled: false,
+        fingerprint,
+        integrity
+      };
+
+      this.cache.set(token, sessionData);
+      const configForCache = cloneConfig(normalizedConfig);
+      configForCache.__historyUserHash = sessionData.historyUserHash;
+      this.decryptedCache.set(token, configForCache);
+
+      try {
+        const adapter = await getStorageAdapter();
+        await adapter.set(token, sessionData, StorageAdapter.CACHE_TYPES.SESSION);
+      } catch (err) { }
+
+      this.emit('sessionCreated', { token, source: 'local' });
+      return token;
+    } catch (err) {
+      log.error(() => ['[SessionManager] Failed to create session:', err.message || err]);
+      throw err;
+    }
   }
 
   async getSession(token) {
@@ -335,8 +281,16 @@ class SessionManager extends EventEmitter {
     }
 
     try {
-      const rawDecrypted = decryptUserConfig(sessionData.config);
-      const { config: decryptedConfig } = stripSessionMetadata(rawDecrypted);
+      let decryptedConfig;
+      if (sessionData.config && sessionData.config._encrypted) {
+        const rawDecrypted = decryptUserConfig(sessionData.config);
+        const stripped = stripSessionMetadata(rawDecrypted);
+        decryptedConfig = stripped.config;
+      } else {
+        const stripped = stripSessionMetadata(sessionData.config);
+        decryptedConfig = stripped.config;
+      }
+
       if (decryptedConfig) {
         decryptedConfig.__historyUserHash = sessionData.historyUserHash;
         this.decryptedCache.set(token, cloneConfig(decryptedConfig));
@@ -371,39 +325,37 @@ class SessionManager extends EventEmitter {
   async updateSession(token, config) {
     if (!token) return false;
     const normalizedConfig = normalizeSensitiveInputsForStorage(stripInternalFlags(cloneConfig(config)));
-    let sessionData = this.cache.get(token);
-
-    if (!sessionData) {
-      await this.loadSessionFromStorage(token);
-      sessionData = this.cache.get(token);
-    }
+    let sessionData = this.cache.get(token) || {};
 
     const fingerprint = computeConfigFingerprint(normalizedConfig);
     const configWithMetadata = embedSessionMetadata(normalizedConfig, token, fingerprint);
-    const encryptedConfig = encryptUserConfig(configWithMetadata);
-    const integrity = computeIntegrityHash(token, fingerprint);
-    const tokenFingerprint = computeTokenFingerprint(token);
+    
+    let encryptedConfig;
+    try {
+      encryptedConfig = encryptUserConfig(configWithMetadata);
+    } catch (_) {
+      encryptedConfig = configWithMetadata;
+    }
 
+    const integrity = computeIntegrityHash(token, fingerprint);
     const now = Date.now();
-    sessionData = sessionData || {};
+
     sessionData.config = encryptedConfig;
     sessionData.lastAccessedAt = now;
     sessionData.updatedAt = now;
     sessionData.fingerprint = fingerprint;
     sessionData.integrity = integrity;
-    sessionData.tokenFingerprint = tokenFingerprint;
+    sessionData.tokenFingerprint = computeTokenFingerprint(token);
     sessionData.historyUserHash = sessionData.historyUserHash || computeHistoryUserHash(token);
 
     this.cache.set(token, sessionData);
     const configForCache = cloneConfig(normalizedConfig);
     configForCache.__historyUserHash = sessionData.historyUserHash;
     this.decryptedCache.set(token, configForCache);
-    this.dirty = true;
 
     try {
       const adapter = await getStorageAdapter();
-      const ttlSeconds = this._calculateTtlSeconds();
-      await adapter.set(token, sessionData, StorageAdapter.CACHE_TYPES.SESSION, ttlSeconds);
+      await adapter.set(token, sessionData, StorageAdapter.CACHE_TYPES.SESSION);
     } catch (err) { }
 
     this.emit('sessionUpdated', { token, source: 'local' });
@@ -417,8 +369,16 @@ class SessionManager extends EventEmitter {
       const stored = await adapter.get(token, StorageAdapter.CACHE_TYPES.SESSION);
       if (!stored) return null;
 
-      const rawDecrypted = decryptUserConfig(stored.config);
-      const { config: decryptedConfig } = stripSessionMetadata(rawDecrypted);
+      let decryptedConfig;
+      if (stored.config && stored.config._encrypted) {
+        const rawDecrypted = decryptUserConfig(stored.config);
+        const stripped = stripSessionMetadata(rawDecrypted);
+        decryptedConfig = stripped.config;
+      } else {
+        const stripped = stripSessionMetadata(stored.config);
+        decryptedConfig = stripped.config;
+      }
+
       if (decryptedConfig) {
         this.cache.set(token, stored);
         this.decryptedCache.set(token, cloneConfig(decryptedConfig));
@@ -427,12 +387,6 @@ class SessionManager extends EventEmitter {
     } catch (_) { }
     return null;
   }
-
-  async saveToDisk() { }
-  async loadFromDisk() { }
-  async restoreFromSnapshotIfStorageEmpty() { }
-  startAutoSave() { }
-  startMemoryCleanup() { }
 
   deleteSession(token) {
     const existed = this.cache.delete(token);
