@@ -42,6 +42,10 @@ class StartupValidator {
     }
 
     try {
+      // Enable TLS when REDIS_TLS=true (required by managed providers like
+      // Upstash, Redis Cloud, etc. that only accept encrypted connections).
+      const useTls = process.env.REDIS_TLS === 'true';
+
       const redisOptions = {
         host: process.env.REDIS_HOST || 'localhost',
         port: process.env.REDIS_PORT || 6379,
@@ -49,6 +53,7 @@ class StartupValidator {
         db: process.env.REDIS_DB ? parseInt(process.env.REDIS_DB, 10) : 0,
         // Use a raw client (no keyPrefix) for validation so SCAN/EXISTS operate on exact keys
         keyPrefix: '',
+        tls: useTls ? {} : undefined,
         maxRetriesPerRequest: 1,
         retryStrategy: () => null, // Don't retry for validation
         lazyConnect: true
