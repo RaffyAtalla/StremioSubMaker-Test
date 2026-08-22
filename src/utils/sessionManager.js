@@ -3,11 +3,7 @@ const { EventEmitter } = require('events');
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
-const { StorageFactory, StorageAdapter } = require('../storage');
 const log = require('./logger');
-const { encryptUserConfig, decryptUserConfig, normalizeSensitiveInputsForStorage } = require('./encryption');
-const { redactToken } = require('./security');
-const { MAX_SESSION_BRIEF_BATCH, normalizeSessionBriefTokens } = require('./sessionBriefBatch');
 
 const DECRYPTED_CACHE_TTL_MS = 5 * 60 * 1000;
 const FAILED_LOOKUP_MAX = 10;
@@ -81,34 +77,6 @@ function computeIntegrityHash(token, fingerprint) {
   }
 }
 
-function embedSessionMetadata(config, token, fingerprint) {
-  const cloned = cloneConfig(config);
-  try {
-    Object.defineProperty(cloned, META_KEYS.SESSION_TOKEN, { value: token, enumerable: true, configurable: true, writable: true });
-    Object.defineProperty(cloned, META_KEYS.SESSION_FINGERPRINT, { value: fingerprint, enumerable: true, configurable: true, writable: true });
-  } catch (_) {
-    cloned[META_KEYS.SESSION_TOKEN] = token;
-    cloned[META_KEYS.SESSION_FINGERPRINT] = fingerprint;
-  }
-  return cloned;
-}
-
-function stripSessionMetadata(config) {
-  if (!config || typeof config !== 'object') {
-    return { config, metadata: {} };
-  }
-  const metadata = {
-    token: config[META_KEYS.SESSION_TOKEN],
-    fingerprint: config[META_KEYS.SESSION_FINGERPRINT]
-  };
-  try {
-    delete config[META_KEYS.SESSION_TOKEN];
-    delete config[META_KEYS.SESSION_FINGERPRINT];
-    stripInternalFlags(config);
-  } catch (_) { }
-  return { config, metadata };
-}
-
 function cloneConfig(config) {
   if (!config || typeof config !== 'object') return config;
   try {
@@ -132,19 +100,10 @@ function tryDecodeStatelessToken(token) {
     }
     const parsed = JSON.parse(jsonStr);
     if (parsed && typeof parsed === 'object') {
-      log.debug(() => `[SessionManager] Decoded stateless config from token successfully`);
       return parsed;
     }
   } catch (_) { }
   return null;
-}
-
-let storageAdapter = null;
-async function getStorageAdapter() {
-  if (!storageAdapter) {
-    storageAdapter = await StorageFactory.getStorageAdapter();
-  }
-  return storageAdapter;
 }
 
 class SessionManager extends EventEmitter {
@@ -154,8 +113,6 @@ class SessionManager extends EventEmitter {
     this.maxSessions = (Number.isFinite(options.maxSessions) && options.maxSessions > 0) ? options.maxSessions : null;
     this.maxAge = options.maxAge || 90 * 24 * 60 * 60 * 1000;
     this.persistencePath = options.persistencePath || path.join(process.cwd(), 'data', 'sessions.json');
-    
-    this.ensureDataDir();
 
     const cacheOptions = {
       ttl: this.maxAge,
@@ -193,41 +150,24 @@ class SessionManager extends EventEmitter {
     return this.getStats();
   }
 
-  ensureDataDir() {
-    try {
-      const dir = path.dirname(this.persistencePath);
-      if (!require('fs').existsSync(dir)) {
-        require('fs').mkdirSync(dir, { recursive: true });
-      }
-    } catch (_) { }
-  }
-
   generateToken() {
     return crypto.randomBytes(16).toString('hex');
   }
 
   async createSession(config) {
     try {
-      const normalizedConfig = normalizeSensitiveInputsForStorage(stripInternalFlags(cloneConfig(config)));
+      const normalizedConfig = stripInternalFlags(cloneConfig(config));
       const token = this.generateToken();
       const tokenFingerprint = computeTokenFingerprint(token);
       const fingerprint = computeConfigFingerprint(normalizedConfig);
-      const configWithMetadata = embedSessionMetadata(normalizedConfig, token, fingerprint);
-      
-      let encryptedConfig;
-      try {
-        encryptedConfig = encryptUserConfig(configWithMetadata);
-      } catch (encErr) {
-        encryptedConfig = configWithMetadata;
-      }
-
       const integrity = computeIntegrityHash(token, fingerprint);
       const now = Date.now();
+
       const sessionData = {
         token,
         tokenFingerprint,
         historyUserHash: computeHistoryUserHash(token),
-        config: encryptedConfig,
+        config: normalizedConfig,
         createdAt: now,
         updatedAt: now,
         lastAccessedAt: now,
@@ -241,13 +181,10 @@ class SessionManager extends EventEmitter {
       configForCache.__historyUserHash = sessionData.historyUserHash;
       this.decryptedCache.set(token, configForCache);
 
-      try {
-        const adapter = await getStorageAdapter();
-        await adapter.set(token, sessionData, StorageAdapter.CACHE_TYPES.SESSION);
-      } catch (err) { }
-
       this.emit('sessionCreated', { token, source: 'local' });
-      return token;
+
+      // Mengembalikan Object lengkap agar API route tidak lempar "Failed to create session"
+      return sessionData;
     } catch (err) {
       log.error(() => ['[SessionManager] Failed to create session:', err.message || err]);
       throw err;
@@ -260,15 +197,10 @@ class SessionManager extends EventEmitter {
     let sessionData = this.cache.get(token);
 
     if (!sessionData) {
-      const loadedConfig = await this.loadSessionFromStorage(token);
-      if (loadedConfig) return loadedConfig;
-
       const recoveredStateless = tryDecodeStatelessToken(token);
       if (recoveredStateless) {
-        log.warn(() => `[SessionManager] Recovered stateless config from token ${redactToken(token)}`);
         return recoveredStateless;
       }
-
       this._recordFailedLookup(token);
       return null;
     }
@@ -280,28 +212,14 @@ class SessionManager extends EventEmitter {
       return cloned;
     }
 
-    try {
-      let decryptedConfig;
-      if (sessionData.config && sessionData.config._encrypted) {
-        const rawDecrypted = decryptUserConfig(sessionData.config);
-        const stripped = stripSessionMetadata(rawDecrypted);
-        decryptedConfig = stripped.config;
-      } else {
-        const stripped = stripSessionMetadata(sessionData.config);
-        decryptedConfig = stripped.config;
-      }
+    const decryptedConfig = cloneConfig(sessionData.config);
+    if (decryptedConfig) {
+      decryptedConfig.__historyUserHash = sessionData.historyUserHash;
+      this.decryptedCache.set(token, cloneConfig(decryptedConfig));
+      return decryptedConfig;
+    }
 
-      if (decryptedConfig) {
-        decryptedConfig.__historyUserHash = sessionData.historyUserHash;
-        this.decryptedCache.set(token, cloneConfig(decryptedConfig));
-        return cloneConfig(decryptedConfig);
-      }
-    } catch (err) { }
-
-    const recoveredStateless = tryDecodeStatelessToken(token);
-    if (recoveredStateless) return recoveredStateless;
-
-    return null;
+    return tryDecodeStatelessToken(token);
   }
 
   _recordFailedLookup(token) {
@@ -324,23 +242,15 @@ class SessionManager extends EventEmitter {
 
   async updateSession(token, config) {
     if (!token) return false;
-    const normalizedConfig = normalizeSensitiveInputsForStorage(stripInternalFlags(cloneConfig(config)));
+    const normalizedConfig = stripInternalFlags(cloneConfig(config));
     let sessionData = this.cache.get(token) || {};
 
     const fingerprint = computeConfigFingerprint(normalizedConfig);
-    const configWithMetadata = embedSessionMetadata(normalizedConfig, token, fingerprint);
-    
-    let encryptedConfig;
-    try {
-      encryptedConfig = encryptUserConfig(configWithMetadata);
-    } catch (_) {
-      encryptedConfig = configWithMetadata;
-    }
-
     const integrity = computeIntegrityHash(token, fingerprint);
     const now = Date.now();
 
-    sessionData.config = encryptedConfig;
+    sessionData.token = token;
+    sessionData.config = normalizedConfig;
     sessionData.lastAccessedAt = now;
     sessionData.updatedAt = now;
     sessionData.fingerprint = fingerprint;
@@ -353,39 +263,12 @@ class SessionManager extends EventEmitter {
     configForCache.__historyUserHash = sessionData.historyUserHash;
     this.decryptedCache.set(token, configForCache);
 
-    try {
-      const adapter = await getStorageAdapter();
-      await adapter.set(token, sessionData, StorageAdapter.CACHE_TYPES.SESSION);
-    } catch (err) { }
-
     this.emit('sessionUpdated', { token, source: 'local' });
     return true;
   }
 
   async loadSessionFromStorage(token) {
-    try {
-      if (!token) return null;
-      const adapter = await getStorageAdapter();
-      const stored = await adapter.get(token, StorageAdapter.CACHE_TYPES.SESSION);
-      if (!stored) return null;
-
-      let decryptedConfig;
-      if (stored.config && stored.config._encrypted) {
-        const rawDecrypted = decryptUserConfig(stored.config);
-        const stripped = stripSessionMetadata(rawDecrypted);
-        decryptedConfig = stripped.config;
-      } else {
-        const stripped = stripSessionMetadata(stored.config);
-        decryptedConfig = stripped.config;
-      }
-
-      if (decryptedConfig) {
-        this.cache.set(token, stored);
-        this.decryptedCache.set(token, cloneConfig(decryptedConfig));
-        return cloneConfig(decryptedConfig);
-      }
-    } catch (_) { }
-    return null;
+    return this.getSession(token);
   }
 
   deleteSession(token) {
@@ -406,9 +289,9 @@ function getSessionManager(options = {}) {
 }
 
 module.exports = {
-  MAX_SESSION_BRIEF_BATCH,
+  MAX_SESSION_BRIEF_BATCH: 100,
   SessionManager,
   getSessionManager,
-  normalizeSessionBriefTokens,
+  normalizeSessionBriefTokens: (tokens) => tokens,
   stripInternalFlags
 };
